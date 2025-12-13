@@ -1,0 +1,193 @@
+name: Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release Version (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+      notes:
+        description: 'Release Notes'
+        required: true
+        default: 'Update details...'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: ./lol-record-analysis-tauri
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: lol-record-analysis-tauri/package-lock.json
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Tauri App
+        run: npm run tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_KEY_PASSWORD }}
+
+      - name: Rename and Compress Binary
+        id: rename
+        shell: pwsh
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          # Remove 'v' prefix if present
+          $cleanVersion = $version -replace '^v',''
+          
+          # --- 1. 处理安装版 (Setup) ---
+          # Path relative to the working directory (lol-record-analysis-tauri)
+          $nsisDir = "src-tauri/target/release/bundle/nsis"
+          
+          # Find the setup .exe file
+          $files = Get-ChildItem -Path $nsisDir -Filter "*.exe"
+          
+          if ($files.Count -eq 0) {
+             Write-Error "No installer found in $nsisDir"
+             exit 1
+          }
+          
+          $file = $files[0]
+          $setupName = "lol-record-analysis-app-$cleanVersion-setup.exe"
+          
+          # Rename the file
+          Rename-Item -Path $file.FullName -NewName $setupName
+
+          # --- Handle Signature ---
+          $sigFiles = Get-ChildItem -Path $nsisDir -Filter "*.sig"
+          if ($sigFiles.Count -gt 0) {
+             $sigFile = $sigFiles[0]
+             $sigName = "$setupName.sig"
+             Rename-Item -Path $sigFile.FullName -NewName $sigName
+          }
+          
+          # --- 2. 处理绿色版 (Portable) ---
+          $releaseDir = "src-tauri/target/release"
+          $exeName = "lol-record-analysis-app.exe"
+          $portable7zName = "lol-record-analysis-app-$cleanVersion-portable.7z"
+          
+          if (!(Test-Path "$releaseDir/$exeName")) {
+             Write-Error "Main executable not found at $releaseDir/$exeName"
+             exit 1
+          }
+          
+          # 压缩绿色版 (仅包含主程序，如果有其他依赖需一并添加)
+          Push-Location $releaseDir
+          7z a $portable7zName $exeName
+          Pop-Location
+
+          # --- 3. 输出路径 ---
+          # Construct the path relative to the repository root for action-gh-release
+          $setupPath = "lol-record-analysis-tauri/$nsisDir/$setupName"
+          $portablePath = "lol-record-analysis-tauri/$releaseDir/$portable7zName"
+          $latestJsonPath = "lol-record-analysis-tauri/$nsisDir/latest.json"
+          
+          Write-Host "Setup path: $setupPath"
+          Write-Host "Portable path: $portablePath"
+          
+          echo "setup_path=$setupPath" >> $env:GITHUB_OUTPUT
+          echo "portable_path=$portablePath" >> $env:GITHUB_OUTPUT
+          echo "latest_json_path=$latestJsonPath" >> $env:GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event.inputs.version }}
+          name: Release ${{ github.event.inputs.version }}
+          body: ${{ github.event.inputs.notes }}
+          files: |
+            ${{ steps.rename.outputs.setup_path }}
+            ${{ steps.rename.outputs.portable_path }}
+            ${{ steps.rename.outputs.latest_json_path }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate latest.json
+        env:
+          VERSION: ${{ github.event.inputs.version }}
+          NOTES: ${{ github.event.inputs.notes }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            
+            const version = process.env.VERSION;
+            const notes = process.env.NOTES;
+            const nsisDir = "src-tauri/target/release/bundle/nsis";
+            
+            const files = fs.readdirSync(nsisDir);
+            const exeFile = files.find(f => f.endsWith(".exe"));
+            const sigFile = files.find(f => f.endsWith(".sig"));
+            
+            if (!exeFile) {
+              console.error("No exe found");
+              process.exit(1);
+            }
+            
+            const url = `https://github.com/wnzzer/rank-analysis/releases/download/${version}/${exeFile}`;
+            let signature = "";
+            
+            if (sigFile) {
+              signature = fs.readFileSync(path.join(nsisDir, sigFile), "utf8");
+            } else {
+              console.warn("No signature file found");
+            }
+            
+            const data = {
+              version: version,
+              notes: notes,
+              pub_date: new Date().toISOString(),
+              platforms: {
+                "windows-x86_64": {
+                  signature: signature,
+                  url: url
+                }
+              }
+            };
+            
+            fs.writeFileSync("latest.json", JSON.stringify(data, null, 2));
+          '
+
+      - name: Upload latest.json
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: lol-record-analysis-tauri/latest.json
+          asset_name: latest.json
+          tag: ${{ github.event.inputs.version }}
+
+  upgradeLink-upload:
+    needs: build-and-release
+    permissions:
+      contents: write 
+    runs-on: ubuntu-latest
+    steps:
+      - name: Wait for Release Assets
+        run: sleep 30 # 等待 30 秒，确保 GitHub Release 资源分发就绪
+
+      - name: Send a request to UpgradeLink
+        uses: toolsetlink/upgradelink-action@v5
+        with:
+          source-url: 'https://github.com/wnzzer/rank-analysis/releases/download/${{ github.event.inputs.version }}/latest.json'
+          access-key: ${{ secrets.UPGRADE_LINK_ACCESS_KEY }}
+          tauri-key: ${{ secrets.UPGRADE_LINK_TAURI_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+
