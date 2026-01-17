@@ -1,0 +1,302 @@
+name: Release Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      notes:
+        description: 'Release Notes'
+        required: true
+        default: 'Update details...'
+      version_override:
+        description: 'Optional: Override App Version (e.g. v1.0.0). Leave empty to use tauri.conf.json'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Upload Assets (Windows)
+    runs-on: windows-latest
+    
+    # 定义全局工作目录，适用于所有 run 步骤
+    defaults:
+      run:
+        working-directory: ./lol-record-analysis-tauri
+    
+    # 导出版本号给下一个 Job 使用
+    outputs:
+      tauri_version: ${{ steps.get_version.outputs.tauri_version }}
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🛠️ Setup Node.js (v20)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: lol-record-analysis-tauri/package-lock.json
+
+      - name: 🦀 Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 📦 Install dependencies
+        run: npm ci
+
+      # --- 核心步骤：智能获取版本号 ---
+      - name: 🔍 Get App Version
+        id: get_version
+        shell: pwsh
+        run: |
+          $overrideVersion = "${{ github.event.inputs.version_override }}"
+          
+          if ($overrideVersion) {
+              Write-Host "Using override version: $overrideVersion"
+              $tauriVersion = $overrideVersion
+          } else {
+              $configPath = "src-tauri/tauri.conf.json"
+              # 读取 JSON 配置
+              $configJson = Get-Content $configPath | Out-String | ConvertFrom-Json
+              
+              # 尝试读取 package.version
+              $tauriVersion = $configJson.package.version
+
+              # 如果为空，尝试读取 Cargo.toml
+              if ([string]::IsNullOrEmpty($tauriVersion)) {
+                  Write-Host "tauri.conf.json version is empty. Checking Cargo.toml..."
+                  $tomlPath = "src-tauri/Cargo.toml"
+                  $tomlContent = Get-Content $tomlPath | Select-String -Pattern '^version\s*=\s*"(.+?)"' 
+                  
+                  if ($tomlContent) {
+                      $tauriVersion = $tomlContent.Matches[0].Groups[1].Value
+                  } else {
+                      Write-Error "Could not find version in tauri.conf.json or Cargo.toml"
+                      exit 1
+                  }
+              }
+              Write-Host "Detected Tauri Version: $tauriVersion"
+          }
+
+          # 确保版本号以 'v' 开头 (GitHub Release 惯例)
+          if ($tauriVersion -notlike 'v*') {
+              $tauriVersion = "v$tauriVersion"
+          }
+          
+          Write-Host "Final Release Version: $tauriVersion"
+          echo "tauri_version=$tauriVersion" >> $env:GITHUB_OUTPUT
+
+      - name: 🕵️ Debug Secrets (Safe)
+        shell: pwsh
+        run: |
+          if ($env:MY_KEY) { 
+              Write-Host "✅ Private Key is detected! Length: $($env:MY_KEY.Length)" 
+              # Check if it looks like a minisign key
+              if ($env:MY_KEY -match "untrusted comment:") {
+                  Write-Host "✅ Key format looks correct (contains 'untrusted comment')."
+              } else {
+                  Write-Warning "⚠️ Key format might be incorrect. It should usually start with 'untrusted comment:'."
+              }
+          } else { 
+              Write-Error "❌ Private Key is MISSING or EMPTY!" 
+          }
+          
+          if ($env:MY_PWD) { 
+              Write-Host "✅ Password is detected!" 
+          } else { 
+              Write-Warning "⚠️ Password is MISSING (If you have no password, ignore this)" 
+          }
+        env:
+          MY_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          MY_PWD: ${{ secrets.TAURI_SIGNING_KEY_PASSWORD }}
+
+      # --- 构建并签名 ---
+      - name: 🔨 Build Tauri App (Signed)
+        run: npm run tauri build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_KEY_PASSWORD }}
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }} # 兼容旧版
+          TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_KEY_PASSWORD }}
+          TAURI_SIGNING_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_KEY_PASSWORD }}
+          TAURI_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_KEY_PASSWORD }} # 兼容旧版
+
+      - name: 📂 List Build Artifacts (Debug)
+        shell: pwsh
+        run: |
+          Write-Host "Listing src-tauri/target/release/bundle/nsis:"
+          Get-ChildItem -Path "src-tauri/target/release/bundle/nsis" -Recurse | Format-Table Name, Length, LastWriteTime
+
+
+      # --- 文件重命名、压缩与路径整理 ---
+      - name: 📝 Rename, Compress, and Set Paths
+        id: prepare_assets
+        shell: pwsh
+        run: |
+          # 获取上一步解析出的版本号
+          $version = "${{ steps.get_version.outputs.tauri_version }}" 
+          $cleanVersion = $version -replace '^v',''
+          
+          $nsisDir = "src-tauri/target/release/bundle/nsis"
+          $releaseDir = "src-tauri/target/release"
+          $appName = "lol-record-analysis-app"
+
+          # 1. 处理安装包 (.exe) 和 签名文件 (.sig)
+          $installerFile = Get-ChildItem -Path $nsisDir -Filter "*.exe" -ErrorAction Stop
+          $sigFile = Get-ChildItem -Path $nsisDir -Filter "*.sig" -ErrorAction SilentlyContinue
+
+          if ($installerFile.Count -ne 1) { 
+            Write-Error "Expected 1 installer file, found $($installerFile.Count)"
+            exit 1 
+          }
+          
+          $setupName = "$appName-$cleanVersion-setup.exe"
+          Rename-Item -Path $installerFile[0].FullName -NewName $setupName
+
+          $sigPath = ""
+            $sigName = "$setupName.sig"
+            if ($sigFile.Count -gt 0) {
+              # 如果 tauri build 已经生成了签名文件，统一改名为与安装包一致
+              Rename-Item -Path $sigFile[0].FullName -NewName $sigName
+            } else {
+              # 一些 Tauri / bundler 组合不会在 NSIS 目录下自动输出 .sig
+              # 这里显式对“安装包文件本身”生成 updater 用的 minisign 签名
+              Write-Host "No .sig found in NSIS output. Generating with 'tauri signer sign'..."
+
+              $installerPath = Join-Path $nsisDir $setupName
+              if (-not (Test-Path $installerPath)) {
+                Write-Error "Installer not found at $installerPath"
+                exit 1
+              }
+
+              if ([string]::IsNullOrEmpty($env:TAURI_PRIVATE_KEY)) {
+                Write-Error "TAURI_PRIVATE_KEY is missing; cannot sign installer."
+                exit 1
+              }
+
+              # 如果你的 key 是空密码，这里保证变量存在，避免 CLI 交互提示
+              if ($null -eq $env:TAURI_PRIVATE_KEY_PASSWORD) {
+                $env:TAURI_PRIVATE_KEY_PASSWORD = ""
+              }
+
+              npx tauri signer sign "$installerPath"
+            }
+
+            $sigCandidate = Join-Path $nsisDir $sigName
+            if (Test-Path $sigCandidate) {
+              $sigPath = "$($env:GITHUB_WORKSPACE)/lol-record-analysis-tauri/$nsisDir/$sigName"
+            } else {
+                Write-Error "Signature file missing: $sigCandidate"
+                exit 1
+            }
+
+          # 2. 处理绿色版 (Portable .7z)
+          $exeName = "$appName.exe"
+          $portable7zName = "$appName-$cleanVersion-portable.7z"
+          
+          if (Test-Path "$releaseDir/$exeName") {
+            Push-Location $releaseDir
+            7z a -t7z $portable7zName $exeName
+            Pop-Location
+          } else {
+            Write-Error "Main executable not found for portable packing."
+            exit 1
+          }
+
+          # 3. 输出供 Release 步骤使用的路径
+          $setupPath = "$($env:GITHUB_WORKSPACE)/lol-record-analysis-tauri/$nsisDir/$setupName"
+          $portablePath = "$($env:GITHUB_WORKSPACE)/lol-record-analysis-tauri/$releaseDir/$portable7zName"
+          
+          echo "setup_path=$setupPath" >> $env:GITHUB_OUTPUT
+          echo "portable_path=$portablePath" >> $env:GITHUB_OUTPUT
+          echo "sig_path=$sigPath" >> $env:GITHUB_OUTPUT 
+        env:
+          TAURI_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_KEY_PASSWORD }}
+
+      # --- 创建 Release 并上传资源 ---
+      - name: 🚀 Create GitHub Release and Upload Assets
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.get_version.outputs.tauri_version }}
+          name: Release ${{ steps.get_version.outputs.tauri_version }}
+          body: ${{ github.event.inputs.notes }}
+          files: |
+            ${{ steps.prepare_assets.outputs.setup_path }}
+            ${{ steps.prepare_assets.outputs.portable_path }}
+          draft: false
+          prerelease: false
+
+      # --- 生成 latest.json ---
+      - name: 📝 Generate latest.json
+        run: |
+          node -e '
+            const fs = require("fs");
+            const path = require("path");
+            
+            const version = process.env.VERSION;
+            const notes = process.env.NOTES;
+            const setupPath = process.env.SETUP_PATH;
+            const sigPath = process.env.SIG_PATH;
+            
+            const exeFile = path.basename(setupPath);
+            let signature = "";
+            
+            if (sigPath && fs.existsSync(sigPath)) {
+                signature = fs.readFileSync(sigPath, "utf8");
+                console.log("Signature loaded successfully.");
+            } else {
+                console.warn("WARNING: Signature file missing or empty.");
+            }
+            
+            const data = {
+                version: version,
+                notes: notes,
+                pub_date: new Date().toISOString(),
+                platforms: {
+                    "windows-x86_64": {
+                        signature: signature,
+                        url: `https://github.com/wnzzer/rank-analysis/releases/download/${version}/${exeFile}`
+                    }
+                }
+            };
+            
+            fs.writeFileSync("latest.json", JSON.stringify(data, null, 2));
+            console.log("latest.json generated.");
+          '
+        env:
+          VERSION: ${{ steps.get_version.outputs.tauri_version }}
+          NOTES: ${{ github.event.inputs.notes }}
+          SETUP_PATH: ${{ steps.prepare_assets.outputs.setup_path }}
+          SIG_PATH: ${{ steps.prepare_assets.outputs.sig_path }}
+
+      # --- 上传 latest.json ---
+      - name: ⬆️ Upload latest.json Asset
+        uses: softprops/action-gh-release@v2 
+        with:
+          tag_name: ${{ steps.get_version.outputs.tauri_version }}
+          files: lol-record-analysis-tauri/latest.json
+
+
+  # --- 任务二：通知 UpgradeLink ---
+  upgradelink-upload:
+    name: Notify UpgradeLink Service
+    needs: build-and-release
+    permissions:
+      contents: write 
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: ⏳ Wait for Release Assets
+        run: sleep 30 
+
+      - name: 🔗 Send a request to UpgradeLink
+        uses: toolsetlink/upgradelink-action@v5
+        with:
+          # 使用 needs.build-and-release.outputs.tauri_version 获取版本号
+          source-url: 'https://github.com/wnzzer/rank-analysis/releases/download/${{ needs.build-and-release.outputs.tauri_version }}/latest.json'
+          access-key: ${{ secrets.UPGRADE_LINK_ACCESS_KEY }}
+          tauri-key: ${{ secrets.UPGRADE_LINK_TAURI_KEY }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}

@@ -17,7 +17,7 @@ static AUTOMATION_MANAGER: OnceLock<AutomationManager> = OnceLock::new();
 
 #[derive(Debug)]
 struct AutomationTask {
-    name: String,
+    _name: String,
     handle: Option<JoinHandle<()>>,
     shutdown_tx: Option<watch::Sender<bool>>,
 }
@@ -37,7 +37,7 @@ impl AutomationManager {
     fn start_task(&self, name: &str, task: impl Future<Output = ()> + Send + 'static) {
         log::info!("Starting automation task: {}", name);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        
+
         let task_name = name.to_string();
         let handle = tokio::spawn(async move {
             log::info!("Task '{}' spawned and running", task_name);
@@ -66,7 +66,7 @@ impl AutomationManager {
         tasks.insert(
             name.to_string(),
             AutomationTask {
-                name: name.to_string(),
+                _name: name.to_string(),
                 handle: Some(handle),
                 shutdown_tx: Some(shutdown_tx),
             },
@@ -142,7 +142,11 @@ async fn start_match_automation() {
             Ok(state) => {
                 let trimmed = state.trim().to_string();
                 if state != trimmed {
-                    log::warn!("Phase string had whitespace! Original: {:?}, Trimmed: {:?}", state, trimmed);
+                    log::warn!(
+                        "Phase string had whitespace! Original: {:?}, Trimmed: {:?}",
+                        state,
+                        trimmed
+                    );
                 }
                 log::debug!("Current phase: {:?} (len={})", trimmed, trimmed.len());
                 trimmed
@@ -158,13 +162,15 @@ async fn start_match_automation() {
             log::debug!("State not changed: '{}'", cur_state);
             continue;
         }
-        
+
         // 调试：显示详细的状态变化信息
         if log::log_enabled!(log::Level::Debug) {
             log::debug!(
                 "State changed: '{}' (len={}) -> '{}' (len={})",
-                last_search_state, last_search_state.len(),
-                cur_state, cur_state.len()
+                last_search_state,
+                last_search_state.len(),
+                cur_state,
+                cur_state.len()
             );
         } else {
             log::info!("State changed: '{}' -> '{}'", last_search_state, cur_state);
@@ -182,13 +188,17 @@ async fn start_match_automation() {
         if !auto_match_enabled && cur_state != LOBBY {
             log::info!("Re-enabling auto-match");
             auto_match_enabled = true;
-            last_search_state = cur_state;  // ✅ 必须更新状态！
+            last_search_state = cur_state; // ✅ 必须更新状态！
             continue;
         }
 
         // 检查是否开启自动匹配
         if !auto_match_enabled {
-            log::info!("Auto-match is disabled, skipping, last_search_state: {}, cur_state: {}", last_search_state, cur_state);
+            log::info!(
+                "Auto-match is disabled, skipping, last_search_state: {}, cur_state: {}",
+                last_search_state,
+                cur_state
+            );
             last_search_state = cur_state;
             continue;
         }
@@ -217,7 +227,11 @@ async fn start_match_automation() {
 
         // 检查是否是自定义游戏
         if lobby.game_config.is_custom {
-            log::info!("Is custom game, skipping, last_search_state: {}, cur_state: {}", last_search_state, cur_state);
+            log::info!(
+                "Is custom game, skipping, last_search_state: {}, cur_state: {}",
+                last_search_state,
+                cur_state
+            );
             continue;
         }
 
@@ -250,13 +264,13 @@ async fn start_match_automation() {
 /// 判断当前用户是否是房主
 async fn is_leader(members: &[crate::lcu::api::lobby::Member]) -> Result<bool, String> {
     use crate::lcu::api::summoner::Summoner;
-    
+
     // 获取当前用户信息
     let my_summoner = Summoner::get_my_summoner().await?;
     let my_puuid = &my_summoner.puuid;
-    
+
     log::debug!("My PUUID: {}", my_puuid);
-    
+
     // 检查当前用户是否是房主
     let am_leader = members.iter().any(|member| {
         let is_me_and_leader = member.puuid == *my_puuid && member.is_leader;
@@ -265,7 +279,7 @@ async fn is_leader(members: &[crate::lcu::api::lobby::Member]) -> Result<bool, S
         }
         is_me_and_leader
     });
-    
+
     Ok(am_leader)
 }
 
@@ -327,8 +341,10 @@ async fn start_select_champion() -> Result<(), String> {
         _ => vec![],
     };
 
-    log::info!("Configured champion selection list: {:?}", my_pick_champion_slice);
-
+    log::info!(
+        "Configured champion selection list: {:?}",
+        my_pick_champion_slice
+    );
 
     let mut not_select_champion_ids = HashMap::new();
 
@@ -397,12 +413,18 @@ async fn start_select_champion() -> Result<(), String> {
 
     log::info!(
         "Action ID: {}, Is In Progress: {}, Completed: {}, My Picked Champion ID: {}",
-        action_id, is_in_progress, completed, my_picked_champion_id
+        action_id,
+        is_in_progress,
+        completed,
+        my_picked_champion_id
     );
 
     if action_id != -1 {
         if is_in_progress && !completed {
-            log::info!("Completing champion selection with ID: {}", will_select_champion_id);
+            log::info!(
+                "Completing champion selection with ID: {}",
+                will_select_champion_id
+            );
             patch_session_action(action_id, will_select_champion_id, "pick".to_string(), true)
                 .await?;
             log::info!("Champion selection completed successfully");
@@ -533,7 +555,10 @@ async fn start_ban_champion() -> Result<(), String> {
         }
     }
 
-    log::info!("Champions unavailable for ban: {:?}", not_ban_champion_ids.keys().collect::<Vec<_>>());
+    log::info!(
+        "Champions unavailable for ban: {:?}",
+        not_ban_champion_ids.keys().collect::<Vec<_>>()
+    );
 
     let will_ban_champion_id = if my_ban_champion_slice.is_empty() {
         log::warn!("No champions configured in banChampionSlice, using default ID: 1");
@@ -568,7 +593,11 @@ async fn start_ban_champion() -> Result<(), String> {
         }
     }
 
-    log::info!("Action ID: {}, Is In Progress: {}", action_id, is_in_progress);
+    log::info!(
+        "Action ID: {}, Is In Progress: {}",
+        action_id,
+        is_in_progress
+    );
 
     if action_id != -1 && is_in_progress {
         log::info!("Banning champion with ID: {}", will_ban_champion_id);
@@ -648,7 +677,7 @@ pub async fn start_automation() {
 
     register_on_change_callback(|key: &str, new_value: &Value| {
         log::info!("Config changed: {} = {:?}", key, new_value);
-        
+
         // 确保 manager 已经初始化
         let manager = match AUTOMATION_MANAGER.get() {
             Some(m) => m,
