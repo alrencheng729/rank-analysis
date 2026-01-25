@@ -1,6 +1,6 @@
 {
   "productName": "lol-record-analysis-app",
-  "version": "1.6.0",
+  "version": "1.6.6",
   "identifier": "com.lol-record-analysis-tauri.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -29,24 +29,31 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "nsis"
-    ],
-    "icon": [
-      "icons/ico.ico",
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "256x256.png"
-    ],
+    "targets": ["nsis"],
+    "icon": ["icons/ico.ico", "icons/32x32.png", "icons/128x128.png", "icons/256x256.png"],
     "windows": {
       "certificateThumbprint": null,
       "digestAlgorithm": "sha256",
       "timestampUrl": "http://timestamp.digicert.com",
       "wix": {
-        "language": [
-          "zh-CN"
-        ]
+        "language": ["zh-CN"]
+      },
+      "nsis": {
+        "installerIcon": "icons/ico.ico",
+        "installMode": "currentUser",
+        "languages": ["SimpChinese"]
       }
+    }
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM2Mzg1MkEyODFGMTdBNTAKUldSUWV2R0JvbEk0TnF1VGlJT1lWUjhTRFRZWjRzTjcxWVNrTjRsbGl4N3g1M0xqQ25UY21DN1MK",
+      "endpoints": [
+        "https://api.upgrade.toolsetlink.com/v1/tauri/upgrade?tauriKey=rX76p0GShXom2yNnlsSDYw&versionName={{current_version}}&target={{target}}&arch={{arch}}",
+        "https://github.com/wnzzer/rank-analysis/releases/latest/download/latest.json"
+      ],
+      "createUpdaterArtifacts": true,
+      "dangerousInsecureTransportProtocol": true
     }
   }
 }

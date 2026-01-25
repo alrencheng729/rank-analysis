@@ -9,8 +9,10 @@ use tokio::sync::OnceCell;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(untagged)]
 pub enum Value {
+    Null,
     String(String),
     Integer(i64),
+    Float(f64),
     Boolean(bool),
     List(Vec<Value>),
     Map(HashMap<String, Value>),
@@ -32,7 +34,11 @@ pub async fn get_cache() -> &'static Cache<String, Value> {
 
             match read_config(CONFIG_PATH) {
                 Ok(config) => {
-                    log::info!("Loaded {} config entries from {}", config.len(), CONFIG_PATH);
+                    log::info!(
+                        "Loaded {} config entries from {}",
+                        config.len(),
+                        CONFIG_PATH
+                    );
                     for (k, v) in config {
                         // 在 async 块中可以自由 .await
                         cache.insert(k.clone(), v.clone()).await;

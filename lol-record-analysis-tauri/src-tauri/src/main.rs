@@ -1,31 +1,11 @@
 // Prevents additional console window on Windows in release, DO NOT REMOVE!!
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use actix_web::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use actix_web::{web, App, HttpResponse, HttpServer};
 use log::info;
-use lol_record_analysis_tauri_lib::lcu::api::asset as asset_api;
-use lol_record_analysis_tauri_lib::state::AppState;
-use lol_record_analysis_tauri_lib::{automation, command};
-use std::io::Result;
+use lol_record_analysis_app_lib::lcu::api::asset as asset_api;
+use lol_record_analysis_app_lib::state::AppState;
+use lol_record_analysis_app_lib::{automation, command};
 use tauri::Manager;
-
-async fn image_ok(bytes: Vec<u8>, content_type: String) -> actix_web::Result<HttpResponse> {
-    Ok(HttpResponse::Ok()
-        .insert_header((CONTENT_TYPE, content_type))
-        .insert_header((CACHE_CONTROL, "public, max-age=86400"))
-        .body(bytes))
-}
-
-// 单一对外接口：GET /asset/{kind}/{id}
-// kind: champion | item | spell | profile
-async fn asset_route(path: web::Path<(String, i64)>) -> actix_web::Result<HttpResponse> {
-    let (kind, id) = path.into_inner();
-    match asset_api::get_asset_binary(kind, id).await {
-        Ok((bytes, ct)) => image_ok(bytes, ct).await,
-        Err(e) => Ok(HttpResponse::NotFound().body(e)),
-    }
-}
 
 // NOTE: main is no longer async
 fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -33,7 +13,7 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     if std::env::var("RUST_LOG").is_err() {
         std::env::set_var("RUST_LOG", "info");
     }
-    
+
     // 配置日志格式，显示时间、级别、文件名、行号和消息
     env_logger::Builder::from_default_env()
         .format_timestamp_millis()
@@ -41,8 +21,8 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             use std::io::Write;
             // 提取文件名（不含路径）
             let file = record.file().unwrap_or("unknown");
-            let file_name = file.split(['/', '\\']).last().unwrap_or(file);
-            
+            let file_name = file.split(['/', '\\']).next_back().unwrap_or(file);
+
             writeln!(
                 buf,
                 "[{} {} {}:{}] {}",
@@ -54,52 +34,65 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             )
         })
         .init();
-    
+
     info!("========================================");
-    info!("Starting Tauri application with HTTP server");
+    info!("Starting Tauri application with Asset Protocol");
     info!("Current working directory: {:?}", std::env::current_dir());
     info!("Config file path: config.yaml");
     info!("========================================");
 
-    // Create a channel to send the discovered port from the HTTP server thread to the main thread
-    let (tx, rx) = std::sync::mpsc::sync_channel::<u16>(1);
-
-    std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-
-        rt.block_on(async move {
-            // 先启动自动化系统（会初始化配置）
-            log::info!("Starting automation system...");
-            tokio::spawn(async { 
-                automation::start_automation().await;
-            });
-
-            // 等待一小段时间确保自动化系统初始化完成
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-            // Initialize asset caches BEFORE starting HTTP server so routes can serve assets immediately.
-            // asset_api::init().await; // logs: Initializing ... + counts
-            tokio::spawn(async {
-                asset_api::init().await;
-            });
-            
-            if let Err(e) = start_http_server(tx).await {
-                log::error!("HTTP server error: {}", e);
-            }
-        });
-    });
-
     let mut app_builder = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init())
+        .plugin(tauri_plugin_process::init())
+        .register_uri_scheme_protocol("asset", move |_app, request| {
+            let path = request.uri().path();
+            // path is like /champion/123
+            let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+
+            if parts.len() < 2 {
+                return tauri::http::Response::builder()
+                    .status(404)
+                    .body(Vec::new())
+                    .unwrap();
+            }
+
+            let kind = parts[0].to_string();
+            let id_str = parts[1];
+            let id = match id_str.parse::<i64>() {
+                Ok(i) => i,
+                Err(_) => {
+                    return tauri::http::Response::builder()
+                        .status(400)
+                        .body(Vec::new())
+                        .unwrap()
+                }
+            };
+
+            let result = tauri::async_runtime::block_on(async move {
+                asset_api::get_asset_binary(kind, id).await
+            });
+
+            match result {
+                Ok((bytes, mime)) => tauri::http::Response::builder()
+                    .header("Content-Type", mime)
+                    .header("Cache-Control", "public, max-age=86400")
+                    .body(bytes)
+                    .unwrap(),
+                Err(e) => tauri::http::Response::builder()
+                    .status(404)
+                    .body(e.into_bytes())
+                    .unwrap(),
+            }
+        })
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             command::config::put_config,
             command::config::get_config,
-            command::config::get_http_server_port,
+            // command::config::get_http_server_port,
             command::config::get_champion_options,
+            command::config::get_game_modes,
             command::get_summoner_by_puuid,
             command::get_summoner_by_name,
             command::get_my_summoner,
@@ -111,22 +104,52 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             command::match_history::get_filter_match_history_by_name,
             command::user_tag::get_user_tag_by_puuid,
             command::user_tag::get_user_tag_by_name,
+            command::user_tag_config::get_all_tag_configs,
+            command::user_tag_config::save_tag_configs,
             command::info::get_platform_name_by_name,
             command::session::get_session_data,
+            command::fandom::update_fandom_data,
+            command::fandom::get_aram_balance,
         ]);
 
-    // In setup, set the HTTP port once received
     app_builder = app_builder.setup(move |app| {
-        if let Ok(port) = rx.recv() {
-            let state = app.state::<AppState>();
-            let _ = state.http_port.set(port);
-        }
+        // 启动自动化系统
+        tauri::async_runtime::spawn(async move {
+            log::info!("Starting automation system...");
+            tokio::spawn(async {
+                automation::start_automation().await;
+            });
+
+            // Initialize asset caches
+            asset_api::init().await;
+        });
 
         // 启动游戏状态监听器
         let app_handle = app.handle().clone();
         tauri::async_runtime::spawn(async move {
-            lol_record_analysis_tauri_lib::game_state_monitor::start_game_state_monitor(app_handle)
+            lol_record_analysis_app_lib::game_state_monitor::start_game_state_monitor(app_handle)
                 .await;
+        });
+
+        // Start Fandom data update schedule (every 2 hours)
+        let fandom_handle = app.handle().clone();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                match lol_record_analysis_app_lib::fandom::api::fetch_aram_balance_data().await {
+                    Ok(data) => {
+                        let state = fandom_handle.state::<AppState>();
+                        let count = data.len();
+                        for (id, balance) in data {
+                            state.fandom_cache.insert(id, balance).await;
+                        }
+                        info!("Updated Fandom ARAM balance data. Count: {}", count);
+                    }
+                    Err(e) => {
+                        log::error!("Failed to update Fandom data: {}", e);
+                    }
+                }
+                tokio::time::sleep(tokio::time::Duration::from_secs(2 * 60 * 60)).await;
+            }
         });
 
         Ok(())
@@ -137,18 +160,4 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .expect("error while building tauri application");
 
     Ok(())
-}
-
-async fn start_http_server(tx: std::sync::mpsc::SyncSender<u16>) -> Result<()> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-
-    let addr = listener.local_addr()?;
-    let port = addr.port();
-    // pass port back to the Tauri process
-    let _ = tx.send(port);
-
-    HttpServer::new(|| App::new().route("/asset/{kind}/{id}", web::get().to(asset_route)))
-        .listen(listener)?
-        .run()
-        .await
 }

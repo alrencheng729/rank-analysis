@@ -58,27 +58,13 @@ static BINARY_CACHE: LazyLock<Cache<String, (Vec<u8>, String)>> = LazyLock::new(
 
 pub async fn init() {
     log::info!("Initializing asset API caches");
-    let items = match lcu_get::<Vec<Item>>(constant::api::ITEM_URI).await {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Failed to fetch items: {}", e);
-            Vec::new()
-        }
-    };
-    let champions = match lcu_get::<Vec<Champion>>(constant::api::CHAMPION_URI).await {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Failed to fetch champions: {}", e);
-            Vec::new()
-        }
-    };
-    let spells = match lcu_get::<Vec<Spell>>(constant::api::SPELL_URI).await {
-        Ok(v) => v,
-        Err(e) => {
-            log::warn!("Failed to fetch spells: {}", e);
-            Vec::new()
-        }
-    };
+    let items = lcu_get::<Vec<Item>>(constant::api::ITEM_URI).await.unwrap();
+    let champions = lcu_get::<Vec<Champion>>(constant::api::CHAMPION_URI)
+        .await
+        .unwrap();
+    let spells = lcu_get::<Vec<Spell>>(constant::api::SPELL_URI)
+        .await
+        .unwrap();
     // let perks = lcu_get::<Vec<Perk>>(constant::api::PERK_URI).await.unwrap();
 
     // 先记录长度，避免后续 move
@@ -143,29 +129,44 @@ async fn fetch_binary(url: &str) -> Result<(Vec<u8>, String), String> {
 
 // 新增：各类型的二进制获取
 async fn get_champion_binary(id: i64) -> Result<(Vec<u8>, String), String> {
-    if let Some(champion) = CHAMPION_CACHE.read().unwrap().get(&id).cloned() {
-        log::info!("Getting champion binary for id {}", id);
-        fetch_binary(&champion.square_portrait_path).await
-    } else {
-        Err(format!("Champion with id {} not found in cache", id))
+    let chapmpion = {
+        let cache = CHAMPION_CACHE.read().unwrap();
+        cache.get(&id).cloned()
+    };
+    match chapmpion {
+        Some(champion) => {
+            log::info!("Getting champion binary for id {}", id);
+            fetch_binary(&champion.square_portrait_path).await
+        }
+        None => Err(format!("Champion with id {} not found in cache", id)),
     }
 }
 
 async fn get_item_binary(id: i64) -> Result<(Vec<u8>, String), String> {
-    if let Some(item) = ITEM_CACHE.read().unwrap().get(&id).cloned() {
-        log::info!("Getting item binary for id {}", id);
-        fetch_binary(&item.icon_path).await
-    } else {
-        Err(format!("Item with id {} not found in cache", id))
+    let item = {
+        let cache = ITEM_CACHE.read().unwrap();
+        cache.get(&id).cloned()
+    };
+    match item {
+        Some(item) => {
+            log::info!("Getting item binary for id {}", id);
+            fetch_binary(&item.icon_path).await
+        }
+        None => Err(format!("Item with id {} not found in cache", id)),
     }
 }
 
 async fn get_spell_binary(id: i64) -> Result<(Vec<u8>, String), String> {
-    if let Some(spell) = SPELL_CACHE.read().unwrap().get(&id).cloned() {
-        log::info!("Getting spell binary for id {}", id);
-        fetch_binary(&spell.icon_path).await
-    } else {
-        Err(format!("Spell with id {} not found in cache", id))
+    let spell = {
+        let cache = SPELL_CACHE.read().unwrap();
+        cache.get(&id).cloned()
+    };
+    match spell {
+        Some(spell) => {
+            log::info!("Getting spell binary for id {}", id);
+            fetch_binary(&spell.icon_path).await
+        }
+        None => Err(format!("Spell with id {} not found in cache", id)),
     }
 }
 

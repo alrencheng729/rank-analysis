@@ -17,6 +17,7 @@ pub struct SessionData {
     #[serde(rename = "type")]
     pub queue_type: String,
     pub type_cn: String,
+    pub queue_id: i32,
     pub team_one: Vec<SessionSummoner>,
     pub team_two: Vec<SessionSummoner>,
 }
@@ -32,6 +33,7 @@ pub struct SessionSummoner {
     pub rank: Rank,
     pub meet_games: Vec<OneGamePlayer>,
     pub pre_group_markers: PreGroupMarker,
+    pub is_loading: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -109,6 +111,7 @@ async fn process_session_data(app_handle: AppHandle) -> Result<(), String> {
             .get(session.game_data.queue.queue_type.as_str())
             .unwrap_or(&"其他")
             .to_string(),
+        queue_id: session.game_data.queue.id,
         team_one: Vec::new(),
         team_two: Vec::new(),
     };
@@ -121,10 +124,16 @@ async fn process_session_data(app_handle: AppHandle) -> Result<(), String> {
         .any(|p| p.puuid == my_summoner.puuid);
 
     if need_swap {
-        std::mem::swap(&mut session.game_data.team_one, &mut session.game_data.team_two);
+        std::mem::swap(
+            &mut session.game_data.team_one,
+            &mut session.game_data.team_two,
+        );
     }
 
     let mode = session.game_data.queue.id;
+
+    // 推送基础信息
+    push_basic_info(&session, &mut session_data, &app_handle).await?;
 
     // 处理队伍一
     process_team(
@@ -149,6 +158,25 @@ async fn process_session_data(app_handle: AppHandle) -> Result<(), String> {
     // 标记预组队
     add_pre_group_markers(&mut session_data);
 
+    // 推送预组队信息
+    let mut markers: HashMap<String, PreGroupMarker> = HashMap::new();
+    for p in &session_data.team_one {
+        if !p.pre_group_markers.name.is_empty() {
+            markers.insert(p.summoner.puuid.clone(), p.pre_group_markers.clone());
+        }
+    }
+    for p in &session_data.team_two {
+        if !p.pre_group_markers.name.is_empty() {
+            markers.insert(p.summoner.puuid.clone(), p.pre_group_markers.clone());
+        }
+    }
+
+    if !markers.is_empty() {
+        app_handle
+            .emit("session-pre-group", &markers)
+            .map_err(|e| e.to_string())?;
+    }
+
     // 处理遇到过的玩家标签
     insert_meet_gamers_record(&mut session_data, &my_summoner.puuid);
 
@@ -159,6 +187,50 @@ async fn process_session_data(app_handle: AppHandle) -> Result<(), String> {
     app_handle
         .emit("session-complete", &session_data)
         .map_err(|e| e.to_string())?;
+
+    Ok(())
+}
+
+async fn push_basic_info(
+    session: &Session,
+    session_data: &mut SessionData,
+    app_handle: &AppHandle,
+) -> Result<(), String> {
+    async fn get_basic_team(team: &[crate::lcu::api::session::OnePlayer]) -> Vec<SessionSummoner> {
+        let mut result = Vec::new();
+        for player in team {
+            if player.puuid.is_empty() {
+                continue;
+            }
+            let summoner = Summoner::get_summoner_by_puuid(&player.puuid)
+                .await
+                .unwrap_or_default();
+
+            result.push(SessionSummoner {
+                champion_id: player.champion_id,
+                champion_key: format!("champion_{}", player.champion_id),
+                summoner,
+                match_history: MatchHistory::default(),
+                user_tag: UserTag::default(),
+                rank: Rank::default(),
+                meet_games: Vec::new(),
+                pre_group_markers: PreGroupMarker::default(),
+                is_loading: true,
+            });
+        }
+        result
+    }
+
+    session_data.team_one = get_basic_team(&session.game_data.team_one).await;
+    session_data.team_two = get_basic_team(&session.game_data.team_two).await;
+
+    app_handle
+        .emit("session-basic-info", &session_data)
+        .map_err(|e| e.to_string())?;
+
+    // 清空数据以便后续处理
+    session_data.team_one.clear();
+    session_data.team_two.clear();
 
     Ok(())
 }
@@ -194,52 +266,57 @@ async fn process_team(
         };
 
         // 获取战绩
-        let match_history = match MatchHistory::get_match_history_by_puuid(&player.puuid, 0, 8)
-            .await
-        {
-            Ok(mut mh) => {
-                mh.enrich_info_cn().ok();
-                mh
-            }
-            Err(e) => {
-                log::warn!("Failed to get match history for {}: {}", player.puuid, e);
-                MatchHistory::default()
-            }
+        // Default to 4 if not configured
+        let count = match crate::config::get_config("matchHistoryCount").await {
+            Ok(crate::config::Value::Integer(v)) => v as i32,
+            Ok(crate::config::Value::String(s)) => s.parse().unwrap_or(4),
+            _ => 4,
         };
 
-        // 获取用户标签
-        let user_tag = match crate::command::user_tag::get_user_tag_by_puuid(&player.puuid, mode)
-            .await
-        {
-            Ok(tag) => tag,
-            Err(e) => {
-                log::warn!("Failed to get user tag for {}: {}", player.puuid, e);
-                // 创建一个默认的 UserTag
-                UserTag {
-                    recent_data: crate::command::user_tag::RecentData {
-                        kda: 0.0,
-                        kills: 0.0,
-                        deaths: 0.0,
-                        assists: 0.0,
-                        select_mode: mode,
-                        select_mode_cn: QUEUE_ID_TO_CN
-                            .get(&(mode as u32))
-                            .unwrap_or(&"未知模式")
-                            .to_string(),
-                        select_wins: 0,
-                        select_losses: 0,
-                        group_rate: 0,
-                        average_gold: 0,
-                        gold_rate: 0,
-                        average_damage_dealt_to_champions: 0,
-                        damage_dealt_to_champions_rate: 0,
-                        friend_and_dispute: Default::default(),
-                        one_game_players_map: None,
-                    },
-                    tag: Vec::new(),
+        let match_history =
+            match MatchHistory::get_match_history_by_puuid(&player.puuid, 0, count - 1).await {
+                Ok(mut mh) => {
+                    mh.enrich_info_cn().ok();
+                    mh
                 }
-            }
-        };
+                Err(e) => {
+                    log::warn!("Failed to get match history for {}: {}", player.puuid, e);
+                    MatchHistory::default()
+                }
+            };
+
+        // 获取用户标签
+        let user_tag =
+            match crate::command::user_tag::get_user_tag_by_puuid(&player.puuid, mode).await {
+                Ok(tag) => tag,
+                Err(e) => {
+                    log::warn!("Failed to get user tag for {}: {}", player.puuid, e);
+                    // 创建一个默认的 UserTag
+                    UserTag {
+                        recent_data: crate::command::user_tag::RecentData {
+                            kda: 0.0,
+                            kills: 0.0,
+                            deaths: 0.0,
+                            assists: 0.0,
+                            select_mode: mode,
+                            select_mode_cn: QUEUE_ID_TO_CN
+                                .get(&(mode as u32))
+                                .unwrap_or(&"未知模式")
+                                .to_string(),
+                            select_wins: 0,
+                            select_losses: 0,
+                            group_rate: 0,
+                            average_gold: 0,
+                            gold_rate: 0,
+                            average_damage_dealt_to_champions: 0,
+                            damage_dealt_to_champions_rate: 0,
+                            friend_and_dispute: Default::default(),
+                            one_game_players_map: None,
+                        },
+                        tag: Vec::new(),
+                    }
+                }
+            };
 
         // 获取段位信息
         let rank = match Rank::get_rank_by_puuid(&player.puuid).await {
@@ -263,6 +340,7 @@ async fn process_team(
             rank,
             meet_games: Vec::new(),
             pre_group_markers: PreGroupMarker::default(),
+            is_loading: false,
         };
 
         // 添加到结果队伍
@@ -291,7 +369,7 @@ async fn process_team(
         };
 
         if let Err(e) = app_handle.emit(event_name, &update) {
-            log::error!("Failed to emit player update event: {}", e.to_string());
+            log::error!("Failed to emit player update event: {}", e);
         } else {
             log::info!("Emitted player update: {} of {}", index + 1, team.len());
         }
@@ -387,7 +465,7 @@ fn add_pre_group_markers(session_data: &mut SessionData) {
     let merged_teams = remove_subsets(&all_maybe_teams);
 
     // 标记预组队信息
-    let pre_group_maker_consts = vec![
+    let pre_group_maker_consts = [
         PreGroupMarker {
             name: "队伍1".to_string(),
             marker_type: "success".to_string(),
@@ -418,7 +496,8 @@ fn add_pre_group_markers(session_data: &mut SessionData) {
                 if one_in_arr(&session_summoner.summoner.puuid, &intersection_team_one)
                     && session_summoner.pre_group_markers.name.is_empty()
                 {
-                    session_summoner.pre_group_markers = pre_group_maker_consts[const_index].clone();
+                    session_summoner.pre_group_markers =
+                        pre_group_maker_consts[const_index].clone();
                     marked = true;
                 }
             }
@@ -427,7 +506,8 @@ fn add_pre_group_markers(session_data: &mut SessionData) {
                 if one_in_arr(&session_summoner.summoner.puuid, &intersection_team_two)
                     && session_summoner.pre_group_markers.name.is_empty()
                 {
-                    session_summoner.pre_group_markers = pre_group_maker_consts[const_index].clone();
+                    session_summoner.pre_group_markers =
+                        pre_group_maker_consts[const_index].clone();
                     marked = true;
                 }
             }
@@ -488,12 +568,14 @@ fn delete_meet_gamers_record(session_data: &mut SessionData) {
 fn remove_subsets(arrays: &[Vec<String>]) -> Vec<Vec<String>> {
     let mut sorted_arrays: Vec<Vec<String>> = arrays.to_vec();
     // 按数组长度排序，确保先处理较大的数组
-    sorted_arrays.sort_by(|a, b| b.len().cmp(&a.len()));
+    sorted_arrays.sort_by_key(|b| std::cmp::Reverse(b.len()));
 
     let mut result: Vec<Vec<String>> = Vec::new();
     for arr in sorted_arrays {
         // 判断当前数组是否被其他数组包含
-        let is_subset_flag = result.iter().any(|res_arr: &Vec<String>| is_subset(&arr, res_arr));
+        let is_subset_flag = result
+            .iter()
+            .any(|res_arr: &Vec<String>| is_subset(&arr, res_arr));
 
         // 如果当前数组没有被包含，就加入结果
         if !is_subset_flag {
@@ -529,4 +611,3 @@ fn intersection(arr1: &[String], arr2: &[String]) -> Vec<String> {
 fn one_in_arr(e: &str, arr: &[String]) -> bool {
     arr.iter().any(|elem| elem == e)
 }
-
